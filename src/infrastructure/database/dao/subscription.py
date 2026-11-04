@@ -1,0 +1,536 @@
+from datetime import datetime, timedelta
+from typing import Optional, cast
+from uuid import UUID
+
+from adaptix import Retort
+from adaptix.conversion import ConversionRetort
+from loguru import logger
+from redis.asyncio import Redis
+from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+
+from src.application.common.dao import SubscriptionDao, UserDao
+from src.application.dto import PlanSubStatsDto, SubscriptionDto, SubscriptionStatsDto, UserDto
+from src.core.enums import SubscriptionStatus
+from src.core.utils.time import datetime_now
+from src.infrastructure.database.models import Subscription, User
+
+from .base import BaseDaoImpl
+
+
+class SubscriptionDaoImpl(SubscriptionDao, BaseDaoImpl):
+    def __init__(
+        self,
+        session: AsyncSession,
+        retort: Retort,
+        conversion_retort: ConversionRetort,
+        redis: Redis,
+        user_dao: UserDao,
+    ) -> None:
+        self.session = session
+        self.retort = retort
+        self.conversion_retort = conversion_retort
+        self.redis = redis
+        self.user_dao = user_dao
+
+        self._convert_to_dto = self.conversion_retort.get_converter(Subscription, SubscriptionDto)
+        self._convert_to_dto_list = self.conversion_retort.get_converter(
+            list[Subscription], list[SubscriptionDto]
+        )
+        self._convert_user_to_dto = self.conversion_retort.get_converter(User, UserDto)
+
+    async def create(self, subscription: SubscriptionDto, telegram_id: int) -> SubscriptionDto:
+        subscription_data = self.retort.dump(subscription)
+        db_subscription = Subscription(**subscription_data, user_telegram_id=telegram_id)
+
+        self.session.add(db_subscription)
+        await self.session.flush()
+
+        await self.user_dao.set_current_subscription(telegram_id, db_subscription.id)
+
+        logger.debug(
+            f"Created new subscription '{db_subscription.id}' "
+            f"for remna user '{subscription.user_remna_id}'"
+        )
+        return self._convert_to_dto(db_subscription)
+
+    async def get_by_id(self, subscription_id: int) -> Optional[SubscriptionDto]:
+        stmt = select(Subscription).where(Subscription.id == subscription_id)
+        db_subscription = await self.session.scalar(stmt)
+
+        if db_subscription:
+            logger.debug(f"Subscription '{subscription_id}' found")
+            return self._convert_to_dto(db_subscription)
+
+        logger.debug(f"Subscription '{subscription_id}' not found")
+        return None
+
+    async def get_by_remna_id(self, user_remna_id: UUID) -> Optional[SubscriptionDto]:
+        stmt = select(Subscription).where(Subscription.user_remna_id == user_remna_id)
+        db_subscription = await self.session.scalar(stmt)
+
+        if db_subscription:
+            logger.debug(f"Subscription found by remna ID '{user_remna_id}'")
+            return self._convert_to_dto(db_subscription)
+
+        logger.debug(f"Subscription with remna ID '{user_remna_id}' not found")
+        return None
+
+    async def get_by_telegram_id(self, telegram_id: int) -> Optional[SubscriptionDto]:
+        stmt = (
+            select(Subscription)
+            .where(Subscription.user_telegram_id == telegram_id)
+            .order_by(Subscription.created_at.desc())
+            .limit(1)
+        )
+        db_subscription = await self.session.scalar(stmt)
+
+        if db_subscription:
+            logger.debug(f"Last subscription for telegram user '{telegram_id}' retrieved")
+            return self._convert_to_dto(db_subscription)
+
+        logger.debug(f"No subscriptions found for telegram user '{telegram_id}'")
+        return None
+
+    async def get_all_by_user(self, telegram_id: int) -> list[SubscriptionDto]:
+        stmt = (
+            select(Subscription)
+            .where(Subscription.user_telegram_id == telegram_id)
+            .order_by(Subscription.created_at.desc())
+        )
+        result = await self.session.scalars(stmt)
+        db_subscriptions = cast(list, result.all())
+
+        logger.debug(f"Retrieved '{len(db_subscriptions)}' subscriptions for user '{telegram_id}'")
+        return self._convert_to_dto_list(db_subscriptions)
+
+    async def get_current(self, telegram_id: int) -> Optional[SubscriptionDto]:
+        stmt = (
+            select(Subscription)
+            .join(User, User.current_subscription_id == Subscription.id)
+            .where(User.telegram_id == telegram_id)
+            .limit(1)
+        )
+        db_subscription = await self.session.scalar(stmt)
+
+        if db_subscription:
+            logger.debug(f"Current active subscription found for user '{telegram_id}'")
+            return self._convert_to_dto(db_subscription)
+
+        logger.debug(f"Active subscription not found for user '{telegram_id}'")
+        return None
+
+    async def update(self, subscription: SubscriptionDto) -> Optional[SubscriptionDto]:
+        if not subscription.id:
+            logger.warning("Subscription ID is missing, skipping update")
+            return None
+
+        if not subscription.changed_data:
+            logger.debug(
+                f"No changes detected for subscription '{subscription.id}', skipping update"
+            )
+            return await self.get_by_id(subscription.id)
+
+        values_to_update = self._serialize_for_update(subscription, SubscriptionDto, Subscription)
+
+        stmt = (
+            update(Subscription)
+            .where(Subscription.id == subscription.id)
+            .values(**values_to_update)
+            .returning(Subscription)
+        )
+        db_subscription = await self.session.scalar(stmt)
+
+        if db_subscription:
+            logger.debug(
+                f"Subscription '{subscription.id}' updated successfully "
+                f"with data '{values_to_update}'"
+            )
+            return self._convert_to_dto(db_subscription)
+
+        logger.warning(f"Failed to update subscription '{subscription.id}'")
+        return None
+
+    async def update_status(
+        self,
+        subscription_id: int,
+        status: SubscriptionStatus,
+    ) -> Optional[SubscriptionDto]:
+        stmt = (
+            update(Subscription)
+            .where(Subscription.id == subscription_id)
+            .values(status=status)
+            .returning(Subscription)
+        )
+        db_subscription = await self.session.scalar(stmt)
+
+        if db_subscription:
+            logger.debug(f"Subscription '{subscription_id}' status updated to '{status}'")
+            return self._convert_to_dto(db_subscription)
+
+        logger.warning(f"Failed to update subscription '{subscription_id}': not found")
+        return None
+
+    async def exists(self, user_remna_id: UUID) -> bool:
+        stmt = select(
+            select(Subscription).where(Subscription.user_remna_id == user_remna_id).exists()
+        )
+        is_exists = await self.session.scalar(stmt) or False
+
+        logger.debug(
+            f"Subscription existence status for remna ID '{user_remna_id}' is '{is_exists}'"
+        )
+        return is_exists
+
+    async def count_active_by_plan(self, plan_id: int) -> int:
+        stmt = (
+            select(func.count(Subscription.id))
+            .join(User, User.current_subscription_id == Subscription.id)
+            .where(
+                Subscription.plan_snapshot["id"].as_integer() == plan_id,
+                Subscription.status == SubscriptionStatus.ACTIVE,
+                User.is_blocked.is_(False),
+                User.is_bot_blocked.is_(False),
+            )
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar() or 0
+
+    async def get_current_expiring_between(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]:
+        stmt = (
+            select(User, Subscription)
+            .join(Subscription, User.current_subscription_id == Subscription.id)
+            .where(
+                Subscription.status == SubscriptionStatus.ACTIVE,
+                Subscription.expire_at >= start_at,
+                Subscription.expire_at <= end_at,
+                User.is_blocked.is_(False),
+                User.is_bot_blocked.is_(False),
+            )
+            .order_by(Subscription.expire_at.asc())
+        )
+
+        rows = await self.session.execute(stmt)
+        result = [
+            (self._convert_user_to_dto(user), self._convert_to_dto(subscription))
+            for user, subscription in rows.all()
+        ]
+
+        logger.debug(
+            f"Retrieved '{len(result)}' current subscriptions expiring between "
+            f"'{start_at}' and '{end_at}'"
+        )
+        return result
+
+    async def get_current_trials_created_between_any_status(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]:
+        stmt = (
+            select(User, Subscription)
+            .join(Subscription, User.current_subscription_id == Subscription.id)
+            .where(
+                Subscription.status.in_(
+                    [
+                        SubscriptionStatus.ACTIVE,
+                        SubscriptionStatus.EXPIRED,
+                    ]
+                ),
+                Subscription.is_trial.is_(True),
+                Subscription.created_at >= start_at,
+                Subscription.created_at <= end_at,
+                User.is_blocked.is_(False),
+                User.is_bot_blocked.is_(False),
+            )
+            .order_by(Subscription.created_at.asc())
+        )
+
+        rows = await self.session.execute(stmt)
+        result = [
+            (self._convert_user_to_dto(user), self._convert_to_dto(subscription))
+            for user, subscription in rows.all()
+        ]
+
+        logger.debug(
+            f"Retrieved '{len(result)}' current trial subscriptions created between "
+            f"'{start_at}' and '{end_at}' regardless of active/expired status"
+        )
+        return result
+
+    async def get_old_trials_without_paid_subscription(
+        self,
+        cutoff: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]:
+        paid_subscription = aliased(Subscription)
+        paid_subscription_exists = (
+            select(paid_subscription.id)
+            .where(
+                paid_subscription.user_telegram_id == User.telegram_id,
+                paid_subscription.is_trial.is_(False),
+                paid_subscription.status != SubscriptionStatus.DELETED,
+            )
+            .exists()
+        )
+
+        stmt = (
+            select(User, Subscription)
+            .join(Subscription, Subscription.user_telegram_id == User.telegram_id)
+            .where(
+                Subscription.status.in_(
+                    [
+                        SubscriptionStatus.ACTIVE,
+                        SubscriptionStatus.EXPIRED,
+                    ]
+                ),
+                Subscription.is_trial.is_(True),
+                Subscription.created_at <= cutoff,
+                or_(
+                    User.purchase_discount < 40,
+                    User.purchase_discount_plan_id.is_(None),
+                ),
+                User.is_blocked.is_(False),
+                User.is_bot_blocked.is_(False),
+                ~paid_subscription_exists,
+            )
+            .order_by(User.telegram_id.asc(), Subscription.created_at.desc())
+        )
+
+        rows = await self.session.execute(stmt)
+        result = [
+            (self._convert_user_to_dto(user), self._convert_to_dto(subscription))
+            for user, subscription in rows.all()
+        ]
+
+        logger.debug(
+            f"Retrieved '{len(result)}' old trial subscriptions created before "
+            f"'{cutoff}' for users without paid subscriptions"
+        )
+        return result
+
+    async def get_current_trials_expired_between(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]:
+        stmt = (
+            select(User, Subscription)
+            .join(Subscription, User.current_subscription_id == Subscription.id)
+            .where(
+                Subscription.status.in_(
+                    [
+                        SubscriptionStatus.ACTIVE,
+                        SubscriptionStatus.EXPIRED,
+                    ]
+                ),
+                Subscription.is_trial.is_(True),
+                Subscription.expire_at >= start_at,
+                Subscription.expire_at <= end_at,
+                User.personal_discount > 0,
+                User.is_blocked.is_(False),
+                User.is_bot_blocked.is_(False),
+            )
+            .order_by(Subscription.expire_at.asc())
+        )
+
+        rows = await self.session.execute(stmt)
+        result = [
+            (self._convert_user_to_dto(user), self._convert_to_dto(subscription))
+            for user, subscription in rows.all()
+        ]
+
+        logger.debug(
+            f"Retrieved '{len(result)}' current trial subscriptions expired between "
+            f"'{start_at}' and '{end_at}' with personal discounts"
+        )
+        return result
+
+    async def get_current_trials_expired_between_any_discount(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]:
+        stmt = (
+            select(User, Subscription)
+            .join(Subscription, User.current_subscription_id == Subscription.id)
+            .where(
+                Subscription.status.in_(
+                    [
+                        SubscriptionStatus.ACTIVE,
+                        SubscriptionStatus.EXPIRED,
+                    ]
+                ),
+                Subscription.is_trial.is_(True),
+                Subscription.expire_at >= start_at,
+                Subscription.expire_at <= end_at,
+                User.is_blocked.is_(False),
+                User.is_bot_blocked.is_(False),
+            )
+            .order_by(Subscription.expire_at.asc())
+        )
+
+        rows = await self.session.execute(stmt)
+        result = [
+            (self._convert_user_to_dto(user), self._convert_to_dto(subscription))
+            for user, subscription in rows.all()
+        ]
+
+        logger.debug(
+            f"Retrieved '{len(result)}' current trial subscriptions expired between "
+            f"'{start_at}' and '{end_at}' regardless of discount status"
+        )
+        return result
+
+    async def count_total_trials(self) -> int:
+        stmt = select(func.count(func.distinct(Subscription.user_telegram_id))).where(
+            Subscription.is_trial.is_(True),
+        )
+        return await self.session.scalar(stmt) or 0
+
+    async def count_converted_from_trial(self) -> int:
+        trial_users_subq = (
+            select(Subscription.user_telegram_id)
+            .where(Subscription.is_trial.is_(True))
+            .scalar_subquery()
+        )
+
+        stmt = select(func.count(func.distinct(Subscription.user_telegram_id))).where(
+            Subscription.user_telegram_id.in_(trial_users_subq),
+            Subscription.is_trial.is_(False),
+            Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.EXPIRED]),
+        )
+        return await self.session.scalar(stmt) or 0
+
+    async def get_stats(self) -> SubscriptionStatsDto:
+        now = datetime_now()
+        week_later = now + timedelta(days=7)
+
+        is_active = Subscription.status == SubscriptionStatus.ACTIVE
+        is_disabled = Subscription.status == SubscriptionStatus.DISABLED
+        is_limited = Subscription.status == SubscriptionStatus.LIMITED
+        is_expired = Subscription.status == SubscriptionStatus.EXPIRED
+
+        is_expiring = and_(
+            is_active,
+            Subscription.expire_at >= now,
+            Subscription.expire_at <= week_later,
+        )
+
+        stmt = (
+            select(
+                func.count().label("total"),
+                func.sum(case((is_active, 1), else_=0)).label("total_active"),
+                func.sum(case((is_disabled, 1), else_=0)).label("total_disabled"),
+                func.sum(case((is_limited, 1), else_=0)).label("total_limited"),
+                func.sum(case((is_expired, 1), else_=0)).label("total_expired"),
+                func.sum(
+                    case((and_(is_active, Subscription.is_trial.is_(True)), 1), else_=0)
+                ).label("active_trial"),
+                func.sum(case((is_expiring, 1), else_=0)).label("expiring_soon"),
+            )
+            .join(User, User.current_subscription_id == Subscription.id)
+            .where(Subscription.status != SubscriptionStatus.DELETED)
+        )
+
+        row = (await self.session.execute(stmt)).mappings().one()
+        logger.debug("Subscription stats fetched")
+
+        return SubscriptionStatsDto(
+            total=int(row["total"] or 0),
+            total_active=int(row["total_active"] or 0),
+            total_expired=int(row["total_expired"] or 0),
+            total_disabled=int(row["total_disabled"] or 0),
+            active_trial=int(row["active_trial"] or 0),
+            expiring_soon=int(row["expiring_soon"] or 0),
+            total_limited=int(row["total_limited"] or 0),
+        )
+
+    async def get_plan_sub_stats(self) -> list[PlanSubStatsDto]:
+        now = datetime_now()
+        week_later = now + timedelta(days=7)
+
+        plan_id_expr = Subscription.plan_snapshot["id"].as_integer()
+        plan_name_expr = Subscription.plan_snapshot["name"].as_string()
+        duration_expr = Subscription.plan_snapshot["duration"].as_integer()
+
+        is_active = Subscription.status == SubscriptionStatus.ACTIVE
+        is_disabled = Subscription.status == SubscriptionStatus.DISABLED
+        is_limited = Subscription.status == SubscriptionStatus.LIMITED
+        is_expired = Subscription.status == SubscriptionStatus.EXPIRED
+
+        is_expiring = and_(
+            is_active,
+            Subscription.expire_at >= now,
+            Subscription.expire_at <= week_later,
+        )
+
+        counts_stmt = (
+            select(
+                plan_id_expr.label("plan_id"),
+                plan_name_expr.label("plan_name"),
+                func.count().label("total"),
+                func.sum(case((is_active, 1), else_=0)).label("total_active"),
+                func.sum(case((is_disabled, 1), else_=0)).label("total_disabled"),
+                func.sum(case((is_limited, 1), else_=0)).label("total_limited"),
+                func.sum(case((is_expired, 1), else_=0)).label("total_expired"),
+                func.sum(case((is_expiring, 1), else_=0)).label("expiring_soon"),
+            )
+            .join(User, User.current_subscription_id == Subscription.id)
+            .where(
+                plan_id_expr.isnot(None),
+                Subscription.status != SubscriptionStatus.DELETED,
+            )
+            .group_by(plan_id_expr, plan_name_expr)
+        )
+
+        duration_subq = (
+            select(
+                plan_id_expr.label("plan_id"),
+                duration_expr.label("duration"),
+                func.row_number()
+                .over(
+                    partition_by=plan_id_expr,
+                    order_by=func.count().desc(),
+                )
+                .label("rn"),
+            )
+            .join(User, User.current_subscription_id == Subscription.id)
+            .where(
+                plan_id_expr.isnot(None),
+                Subscription.status != SubscriptionStatus.DELETED,
+            )
+            .group_by(plan_id_expr, duration_expr)
+            .subquery()
+        )
+        popular_duration_stmt = select(
+            duration_subq.c.plan_id,
+            duration_subq.c.duration,
+        ).where(duration_subq.c.rn == 1)
+
+        counts_rows = await self.session.execute(counts_stmt)
+        duration_rows = await self.session.execute(popular_duration_stmt)
+
+        popular_duration_map: dict[int, int] = {
+            row.plan_id: (row.duration or 0) for row in duration_rows.mappings()
+        }
+
+        logger.debug("Plan subscription stats fetched")
+        return [
+            PlanSubStatsDto(
+                plan_id=row["plan_id"],
+                plan_name=row["plan_name"] or "",
+                total=int(row["total"] or 0),
+                total_active=int(row["total_active"] or 0),
+                total_disabled=int(row["total_disabled"] or 0),
+                total_limited=int(row["total_limited"] or 0),
+                total_expired=int(row["total_expired"] or 0),
+                expiring_soon=int(row["expiring_soon"] or 0),
+                popular_duration=popular_duration_map.get(row["plan_id"], 0),
+            )
+            for row in counts_rows.mappings()
+        ]

@@ -1,0 +1,70 @@
+from datetime import datetime
+from typing import Optional, Protocol, runtime_checkable
+from uuid import UUID
+
+from src.application.dto import PlanSubStatsDto, SubscriptionDto, SubscriptionStatsDto, UserDto
+from src.core.enums import SubscriptionStatus
+
+
+@runtime_checkable
+class SubscriptionDao(Protocol):
+    async def create(self, subscription: SubscriptionDto, telegram_id: int) -> SubscriptionDto: ...
+
+    async def get_by_id(self, subscription_id: int) -> Optional[SubscriptionDto]: ...
+
+    async def get_by_remna_id(self, remna_id: UUID) -> Optional[SubscriptionDto]: ...
+
+    async def get_by_telegram_id(self, telegram_id: int) -> Optional[SubscriptionDto]: ...
+
+    async def get_all_by_user(self, telegram_id: int) -> list[SubscriptionDto]: ...
+
+    async def get_current(self, telegram_id: int) -> Optional[SubscriptionDto]: ...
+
+    async def update(self, subscription: SubscriptionDto) -> Optional[SubscriptionDto]: ...
+
+    async def update_status(
+        self,
+        subscription_id: int,
+        status: SubscriptionStatus,
+    ) -> Optional[SubscriptionDto]: ...
+
+    async def exists(self, remna_id: UUID) -> bool: ...
+
+    async def count_active_by_plan(self, plan_id: int) -> int: ...
+
+    async def get_current_expiring_between(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]: ...
+
+    async def get_current_trials_created_between_any_status(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]: ...
+
+    async def get_old_trials_without_paid_subscription(
+        self,
+        cutoff: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]: ...
+
+    async def get_current_trials_expired_between(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]: ...
+
+    async def get_current_trials_expired_between_any_discount(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[tuple[UserDto, SubscriptionDto]]: ...
+
+    async def count_total_trials(self) -> int: ...
+
+    async def count_converted_from_trial(self) -> int: ...
+
+    async def get_stats(self) -> SubscriptionStatsDto: ...
+
+    async def get_plan_sub_stats(self) -> list[PlanSubStatsDto]: ...

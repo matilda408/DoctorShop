@@ -1,0 +1,191 @@
+from typing import Any
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+from aiogram_dialog import DialogManager
+from dishka import FromDishka
+from dishka.integrations.aiogram_dialog import inject
+from loguru import logger
+
+from src.application.common import TranslatorRunner
+from src.application.common.dao import ReferralDao, SettingsDao
+from src.application.dto import UserDto
+from src.application.services import BotService
+from src.application.use_cases.misc.queries.menu import GetMenuData
+from src.core.config import AppConfig
+from src.core.enums import ReferralLevel, Role
+from src.core.exceptions import MenuRenderError
+from src.core.utils.i18n_helpers import i18n_format_expire_time
+
+HELP_ICON_CUSTOM_EMOJI_ID: str | None = None
+USER_AGREEMENT_URL = "https://telegram.org/tos"
+PRIVACY_POLICY_URL = "https://telegram.org/privacy"
+INVITE_SHARE_TEXT = "Привет! Здесь можно получить онлайн-консультацию врача или другого эксперта."
+
+
+def make_happ_open_url(subscription_url: str) -> str:
+    url_parts = urlsplit(subscription_url)
+    query = dict(parse_qsl(url_parts.query, keep_blank_values=True))
+    query["open"] = "happ"
+    return urlunsplit(
+        (
+            url_parts.scheme,
+            url_parts.netloc,
+            url_parts.path,
+            urlencode(query),
+            url_parts.fragment,
+        )
+    )
+
+
+@inject
+async def menu_getter(
+    dialog_manager: DialogManager,
+    config: AppConfig,
+    user: UserDto,
+    bot_service: FromDishka[BotService],
+    i18n: FromDishka[TranslatorRunner],
+    get_menu_data: FromDishka[GetMenuData],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    try:
+        menu_data = await get_menu_data(user)
+        support_url = bot_service.get_support_url(text=i18n.get("message.help"))
+
+        purchase_discount = user.purchase_discount or 0
+        personal_discount = user.personal_discount or 0
+        show_purchase_discount = purchase_discount > 0 and purchase_discount >= personal_discount
+        show_personal_discount = personal_discount > 0 and not show_purchase_discount
+
+        data: dict[str, Any] = {
+            # user
+            "telegram_id": user.telegram_id,
+            "name": user.name,
+            "personal_discount": personal_discount,
+            "show_personal_discount": show_personal_discount,
+            "purchase_discount": purchase_discount,
+            "show_purchase_discount": show_purchase_discount,
+            # ui / config
+            "is_mini_app": config.bot.is_mini_app,
+            "support_url": support_url,
+            "user_agreement_url": USER_AGREEMENT_URL,
+            "privacy_policy_url": PRIVACY_POLICY_URL,
+            "help_icon_custom_emoji_id": HELP_ICON_CUSTOM_EMOJI_ID or 0,
+            "is_expert": user.role == Role.EXPERT,
+            "can_apply_expert": user.role == Role.USER,
+            # referral
+            "referral_enabled": menu_data.is_referral_enabled,
+            # defaults
+            "has_subscription": False,
+            "has_active_subscription": False,
+            "connectable": False,
+            "trial_available": False,
+            "is_trial": False,
+            # subscription-related (nullable)
+            "status": None,
+            "expire_time": None,
+            "connection_url": None,
+            "subscription_url": None,
+            "happ_connection_url": None,
+            "row_1_buttons": [b for b in menu_data.custom_buttons if b.index in (1, 2)],
+            "row_2_buttons": [b for b in menu_data.custom_buttons if b.index in (3, 4)],
+            "row_3_buttons": [b for b in menu_data.custom_buttons if b.index in (5, 6)],
+        }
+
+        if not menu_data.current_subscription:
+            logger.debug(f"User {user.telegram_id} has no active subscription")
+            data["trial_available"] = menu_data.is_trial_available and menu_data.available_trial
+            return data
+
+        subscription = menu_data.current_subscription
+
+        data.update(
+            {
+                "has_subscription": True,
+                "has_active_subscription": subscription.is_active,
+                "is_trial": subscription.is_trial,
+                "status": subscription.current_status,
+                "expire_time": i18n_format_expire_time(subscription.expire_at),
+                "connectable": subscription.is_active,
+                "connection_url": config.bot.mini_app_url
+                if isinstance(config.bot.mini_app_url, str)
+                else subscription.url,
+                "subscription_url": subscription.url,
+                "happ_connection_url": (
+                    make_happ_open_url(subscription.url) if subscription.is_active else None
+                ),
+            }
+        )
+        logger.debug(f"Menu data for user {user.telegram_id}: {data}")
+        return data
+
+    except Exception as e:
+        raise MenuRenderError(str(e)) from e
+
+
+@inject
+async def invite_getter(
+    dialog_manager: DialogManager,
+    user: UserDto,
+    bot_service: FromDishka[BotService],
+    i18n: FromDishka[TranslatorRunner],
+    settings_dao: FromDishka[SettingsDao],
+    referral_dao: FromDishka[ReferralDao],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    settings = await settings_dao.get()
+    referrals = await referral_dao.get_referrals_count(user.telegram_id)
+    payments = await referral_dao.get_referrals_with_payment_count(user.telegram_id)
+    referral_url = await bot_service.get_referral_url(user.referral_code)
+    referral_reward_days = settings.referral.reward.config.get(ReferralLevel.FIRST, 0)
+    share_url = (
+        "https://t.me/share/url"
+        f"?url={quote(referral_url, safe='')}"
+        f"&text={quote(INVITE_SHARE_TEXT, safe='')}"
+    )
+    support_url = bot_service.get_support_url(text=i18n.get("message.withdraw-points"))
+
+    return {
+        "reward_type": settings.referral.reward.type,
+        "referrals": referrals,
+        "payments": payments,
+        "points": user.points,
+        "is_points_reward": settings.referral.reward.is_points,
+        "has_points": True if user.points > 0 else False,
+        "referral_url": referral_url,
+        "referral_reward_days": referral_reward_days,
+        "share_url": share_url,
+        "withdraw": support_url,
+    }
+
+
+@inject
+async def invite_about_getter(
+    dialog_manager: DialogManager,
+    i18n: FromDishka[TranslatorRunner],
+    settings_dao: FromDishka[SettingsDao],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    settings = await settings_dao.get()
+    reward_config = settings.referral.reward.config
+
+    max_level = settings.referral.level.value
+    identical_reward = settings.referral.reward.is_identical
+
+    reward_levels: dict[str, str] = {}
+    for lvl, val in reward_config.items():
+        if lvl.value <= max_level:
+            reward_levels[f"reward_level_{lvl.value}"] = i18n.get(
+                "msg-invite-reward",
+                value=val,
+                reward_strategy_type=settings.referral.reward.strategy,
+                reward_type=settings.referral.reward.type,
+            )
+
+    return {
+        **reward_levels,
+        "reward_type": settings.referral.reward.type,
+        "reward_strategy_type": settings.referral.reward.strategy,
+        "accrual_strategy": settings.referral.accrual_strategy,
+        "identical_reward": identical_reward,
+        "max_level": max_level,
+    }

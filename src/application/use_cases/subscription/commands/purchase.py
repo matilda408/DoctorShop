@@ -1,0 +1,330 @@
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Optional
+from uuid import uuid4
+
+from loguru import logger
+
+from src.application.common import EventPublisher, Interactor, Redirect, Remnawave, TranslatorRunner
+from src.application.common.dao import SubscriptionDao, TransactionDao, UserDao
+from src.application.common.uow import UnitOfWork
+from src.application.dto import (
+    PlanSnapshotDto,
+    PriceDetailsDto,
+    SubscriptionDto,
+    TransactionDto,
+    UserDto,
+)
+from src.application.events import TrialActivatedEvent
+from src.application.use_cases.referral.commands.rewards import (
+    AssignReferralRewards,
+    AssignReferralRewardsDto,
+)
+from src.core.enums import (
+    Currency,
+    PaymentGatewayType,
+    PurchaseType,
+    SubscriptionStatus,
+    TransactionStatus,
+)
+from src.core.exceptions import PurchaseError, TrialError
+from src.core.types import RemnaUserDto
+from src.core.utils.converters import days_to_datetime
+from src.core.utils.i18n_helpers import i18n_format_days
+from src.core.utils.time import datetime_now
+
+
+@dataclass(frozen=True)
+class ActivateTrialSubscriptionDto:
+    user: UserDto
+    plan: PlanSnapshotDto
+
+
+class ActivateTrialSubscription(Interactor[ActivateTrialSubscriptionDto, None]):
+    required_permission = None
+
+    def __init__(
+        self,
+        uow: UnitOfWork,
+        user_dao: UserDao,
+        subscription_dao: SubscriptionDao,
+        remnawave: Remnawave,
+        event_publisher: EventPublisher,
+        redirect: Redirect,
+        i18n: TranslatorRunner,
+        assign_referral_rewards: AssignReferralRewards,
+    ) -> None:
+        self.uow = uow
+        self.user_dao = user_dao
+        self.subscription_dao = subscription_dao
+        self.remnawave = remnawave
+        self.event_publisher = event_publisher
+        self.redirect = redirect
+        self.i18n = i18n
+        self.assign_referral_rewards = assign_referral_rewards
+
+    async def _execute(self, actor: UserDto, data: ActivateTrialSubscriptionDto) -> None:
+        user = data.user
+        plan = data.plan
+
+        logger.info(f"{actor.log} Started trial for user '{user.telegram_id}'")
+
+        try:
+            created_user = await self.remnawave.create_user(user, plan=plan)
+
+            trial_subscription = SubscriptionDto(
+                user_remna_id=created_user.uuid,
+                status=SubscriptionStatus(created_user.status),
+                is_trial=True,
+                tag=plan.tag,
+                expire_at=created_user.expire_at,
+                url=created_user.subscription_url,
+                plan_snapshot=plan,
+            )
+
+            async with self.uow:
+                await self.subscription_dao.create(
+                    subscription=trial_subscription,
+                    telegram_id=user.telegram_id,
+                )
+                await self.user_dao.set_trial_available(user.telegram_id, False)
+                await self.uow.commit()
+
+            logger.debug(
+                f"{actor.log} Created new trial subscription for user '{user.telegram_id}'"
+            )
+
+            event = TrialActivatedEvent(
+                telegram_id=user.telegram_id,
+                username=user.username,
+                name=user.name,
+                plan_name=self.i18n.get(plan.name),
+                plan_duration=i18n_format_days(plan.duration),
+            )
+            await self.event_publisher.publish(event)
+            await self.assign_referral_rewards.system(
+                AssignReferralRewardsDto(
+                    user=user,
+                    transaction=TransactionDto(
+                        payment_id=uuid4(),
+                        user_telegram_id=user.telegram_id,
+                        status=TransactionStatus.COMPLETED,
+                        purchase_type=PurchaseType.NEW,
+                        gateway_type=PaymentGatewayType.URLPAY,
+                        pricing=PriceDetailsDto(
+                            original_amount=Decimal(0),
+                            discount_percent=0,
+                            final_amount=Decimal(0),
+                        ),
+                        currency=Currency.RUB,
+                        plan_snapshot=plan,
+                    ),
+                    is_trial_activation=True,
+                )
+            )
+            await self.redirect.to_success_trial(user.telegram_id)
+            logger.info(
+                f"{actor.log} Trial subscription completed "
+                f"successfully for user '{user.telegram_id}'"
+            )
+
+        except Exception as e:
+            logger.exception(f"{actor.log} Failed to give trial for user '{user.telegram_id}'")
+            await self.redirect.to_failed_payment(user.telegram_id)
+            raise TrialError(e)
+
+
+@dataclass(frozen=True)
+class PurchaseSubscriptionDto:
+    user: UserDto
+    transaction: TransactionDto
+    subscription: Optional[SubscriptionDto]
+
+
+class PurchaseSubscription(Interactor[PurchaseSubscriptionDto, None]):
+    required_permission = None
+
+    def __init__(
+        self,
+        uow: UnitOfWork,
+        user_dao: UserDao,
+        subscription_dao: SubscriptionDao,
+        transaction_dao: TransactionDao,
+        remnawave: Remnawave,
+        redirect: Redirect,
+    ) -> None:
+        self.uow = uow
+        self.user_dao = user_dao
+        self.subscription_dao = subscription_dao
+        self.transaction_dao = transaction_dao
+        self.remnawave = remnawave
+        self.redirect = redirect
+
+    async def _execute(self, actor: UserDto, data: PurchaseSubscriptionDto) -> None:  # noqa: C901
+        user = data.user
+        transaction = data.transaction
+        subscription = data.subscription
+        plan = transaction.plan_snapshot
+        purchase_type = transaction.purchase_type
+        has_trial = subscription.is_trial if subscription else False
+
+        if not user or not plan:
+            logger.error(f"{actor.log} User or plan not found for transaction '{transaction.id}'")
+            return
+
+        logger.info(
+            f"{actor.log} Purchase subscription started: '{purchase_type}' "
+            f"for user '{user.telegram_id}'"
+        )
+
+        async with self.uow:
+            try:
+                # 1. NEW PURCHASE (NOT TRIAL)
+                if purchase_type == PurchaseType.NEW and not has_trial:
+                    created_user = await self.remnawave.create_user(user, plan=plan)
+                    new_sub = self._build_subscription_dto(created_user, plan)
+
+                    await self.subscription_dao.create(
+                        subscription=new_sub,
+                        telegram_id=user.telegram_id,
+                    )
+                    await self.user_dao.set_trial_available(user.telegram_id, False)
+                    await self._clear_purchase_discount_if_used(user, plan)
+                    await self.uow.commit()
+
+                    logger.debug(
+                        f"{actor.log} Created new subscription for user '{user.telegram_id}'"
+                    )
+
+                # 2. RENEW (NOT TRIAL)
+                elif purchase_type == PurchaseType.RENEW and not has_trial:
+                    if not subscription:
+                        raise ValueError(
+                            f"No subscription found for renewal for user '{user.telegram_id}'"
+                        )
+
+                    base_date = max(subscription.expire_at, datetime_now())
+                    duration = transaction.plan_snapshot.duration
+
+                    if duration == 0:
+                        new_expire = days_to_datetime(duration)  # unlimited
+                    else:
+                        base_date = max(subscription.expire_at, datetime_now())
+                        new_expire = base_date + timedelta(days=duration)
+
+                    subscription.expire_at = new_expire
+
+                    updated_user = await self.remnawave.update_user(
+                        user=user,
+                        uuid=subscription.user_remna_id,
+                        subscription=subscription,
+                    )
+
+                    subscription.plan_snapshot = plan
+                    await self.subscription_dao.update(subscription)
+                    await self._clear_purchase_discount_if_used(user, plan)
+                    await self.uow.commit()
+                    logger.debug(f"{actor.log} Renewed subscription for user '{user.telegram_id}'")
+
+                # 3. CHANGE OR CONVERT FROM TRIAL
+                elif purchase_type == PurchaseType.CHANGE or has_trial:
+                    if not subscription:
+                        raise ValueError(
+                            f"No subscription found for change for user '{user.telegram_id}'"
+                        )
+
+                    new_expire = self._get_extended_expire(
+                        subscription.expire_at,
+                        plan.duration,
+                    )
+                    self._apply_plan_to_subscription(subscription, plan, new_expire)
+
+                    updated_user = await self.remnawave.update_user(
+                        user=user,
+                        uuid=subscription.user_remna_id,
+                        subscription=subscription,
+                    )
+
+                    subscription.status = SubscriptionStatus(updated_user.status)
+                    subscription.expire_at = updated_user.expire_at
+                    subscription.url = updated_user.subscription_url
+                    await self.subscription_dao.update(subscription)
+                    await self.user_dao.set_trial_available(user.telegram_id, False)
+
+                    await self._clear_purchase_discount_if_used(user, plan)
+                    await self.uow.commit()
+                    logger.debug(f"{actor.log} Changed subscription for user '{user.telegram_id}'")
+
+                else:
+                    raise ValueError(
+                        f"Unknown purchase type '{purchase_type}' for user '{user.telegram_id}'"
+                    )
+
+                await self.redirect.to_success_payment(user.telegram_id, purchase_type)
+                logger.info(
+                    f"{actor.log} Purchase subscription completed for user '{user.telegram_id}'"
+                )
+
+            except Exception as e:
+                logger.exception(
+                    f"{actor.log} Failed to process purchase type '{purchase_type}' "
+                    f"for user '{user.telegram_id}'"
+                )
+
+                await self.transaction_dao.update_status(
+                    transaction.payment_id,
+                    TransactionStatus.FAILED,
+                )
+                await self.uow.commit()
+
+                await self.redirect.to_failed_payment(user.telegram_id)
+                raise PurchaseError(e)
+
+    @staticmethod
+    def _get_extended_expire(current_expire: datetime, duration: int) -> datetime:
+        if duration == 0:
+            return days_to_datetime(duration)
+
+        return max(current_expire, datetime_now()) + timedelta(days=duration)
+
+    async def _clear_purchase_discount_if_used(
+        self,
+        user: UserDto,
+        plan: PlanSnapshotDto,
+    ) -> None:
+        if not user.purchase_discount:
+            return
+
+        if user.purchase_discount_plan_id is not None and user.purchase_discount_plan_id != plan.id:
+            return
+
+        user.purchase_discount = 0
+        user.purchase_discount_plan_id = None
+        await self.user_dao.update(user)
+
+    @staticmethod
+    def _apply_plan_to_subscription(
+        subscription: SubscriptionDto,
+        plan: PlanSnapshotDto,
+        expire_at: datetime,
+    ) -> None:
+        subscription.status = SubscriptionStatus.ACTIVE
+        subscription.is_trial = False
+        subscription.tag = plan.tag
+        subscription.expire_at = expire_at
+        subscription.plan_snapshot = plan
+
+    def _build_subscription_dto(
+        self,
+        remna_user: RemnaUserDto,
+        plan: PlanSnapshotDto,
+    ) -> SubscriptionDto:
+        return SubscriptionDto(
+            user_remna_id=remna_user.uuid,
+            status=SubscriptionStatus(remna_user.status),
+            tag=plan.tag,
+            expire_at=remna_user.expire_at,
+            url=remna_user.subscription_url,
+            plan_snapshot=plan,
+        )

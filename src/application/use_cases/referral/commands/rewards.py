@@ -1,0 +1,347 @@
+from dataclasses import dataclass, replace
+from datetime import timedelta
+
+from loguru import logger
+
+from src.application.common import EventPublisher, Interactor, Remnawave
+from src.application.common.dao import (
+    ConsultationDao,
+    ReferralDao,
+    SettingsDao,
+    SubscriptionDao,
+    UserDao,
+)
+from src.application.common.uow import UnitOfWork
+from src.application.dto import (
+    PlanSnapshotDto,
+    ReferralRewardDto,
+    SubscriptionDto,
+    TransactionDto,
+    UserDto,
+)
+from src.application.events import ReferralRewardFailedEvent, ReferralRewardReceivedEvent
+from src.application.use_cases.referral.queries.calculations import (
+    CalculateReferralReward,
+    CalculateReferralRewardDto,
+)
+from src.application.use_cases.user.commands.profile_edit import (
+    ChangeUserPoints,
+    ChangeUserPointsDto,
+)
+from src.core.enums import (
+    PurchaseType,
+    ReferralAccrualStrategy,
+    ReferralLevel,
+    ReferralRewardType,
+    SubscriptionStatus,
+)
+from src.core.types import RemnaUserDto
+from src.core.utils.time import datetime_now
+
+
+@dataclass(frozen=True)
+class GiveReferrerRewardDto:
+    user_telegram_id: int
+    reward: ReferralRewardDto
+    referred_name: str
+    plan_snapshot: PlanSnapshotDto
+    expert_profile_id: int | None = None
+
+
+class GiveReferrerReward(Interactor[GiveReferrerRewardDto, None]):
+    required_permission = None
+
+    def __init__(
+        self,
+        uow: UnitOfWork,
+        user_dao: UserDao,
+        subscription_dao: SubscriptionDao,
+        referral_dao: ReferralDao,
+        event_publisher: EventPublisher,
+        change_user_points: ChangeUserPoints,
+        remnawave: Remnawave,
+        consultation_dao: ConsultationDao,
+    ) -> None:
+        self.uow = uow
+        self.user_dao = user_dao
+        self.subscription_dao = subscription_dao
+        self.referral_dao = referral_dao
+        self.event_publisher = event_publisher
+        self.change_user_points = change_user_points
+        self.remnawave = remnawave
+        self.consultation_dao = consultation_dao
+
+    async def _execute(self, actor: UserDto, data: GiveReferrerRewardDto) -> None:
+        reward = data.reward
+
+        user = await self.user_dao.get_by_telegram_id(data.user_telegram_id)
+        if not user:
+            logger.warning(
+                f"{actor.log} User '{data.user_telegram_id}' not found, unable to apply reward"
+            )
+            return
+
+        logger.info(
+            f"{actor.log} Start applying reward of '{reward.amount}' "
+            f"'{reward.type}' to user '{user.telegram_id}'"
+        )
+        if reward.type == ReferralRewardType.POINTS:
+            await self.change_user_points.system(
+                ChangeUserPointsDto(
+                    telegram_id=user.telegram_id,
+                    amount=reward.amount,
+                )
+            )
+
+        elif reward.type == ReferralRewardType.EXTRA_DAYS:
+            if data.expert_profile_id is not None:
+                consultation = await self.consultation_dao.get_by_client_and_expert(
+                    user.telegram_id, data.expert_profile_id
+                )
+                async with self.uow:
+                    if consultation and consultation.is_active:
+                        consultation.access_expires_at = max(
+                            consultation.access_expires_at, datetime_now()
+                        ) + timedelta(days=reward.amount)
+                        await self.consultation_dao.update(consultation)
+                    else:
+                        user.consultation_bonus_days += reward.amount
+                        await self.user_dao.update(user)
+                    await self.uow.commit()
+
+                event_reward = ReferralRewardReceivedEvent(
+                    user=user,
+                    name=data.referred_name,
+                    value=reward.amount,
+                    reward_type=reward.type,
+                )
+                await self.event_publisher.publish(event_reward)
+                async with self.uow:
+                    await self.referral_dao.mark_reward_as_issued(reward.id)  # type: ignore[arg-type]
+                    await self.uow.commit()
+                logger.info(f"{actor.log} Applied consultation bonus days to '{user.telegram_id}'")
+                return
+
+            subscription = await self.subscription_dao.get_current(user.telegram_id)
+
+            if not subscription:
+                logger.info(
+                    f"{actor.log} Current subscription not found for user "
+                    f"'{user.telegram_id}', creating referral bonus subscription"
+                )
+                bonus_plan = replace(data.plan_snapshot, duration=reward.amount, is_trial=False)
+                remna_user = await self.remnawave.create_user(user=user, plan=bonus_plan)
+                bonus_subscription = self._build_subscription_dto(
+                    remna_user=remna_user,
+                    plan=bonus_plan,
+                )
+
+                async with self.uow:
+                    await self.subscription_dao.create(
+                        subscription=bonus_subscription,
+                        telegram_id=user.telegram_id,
+                    )
+                    await self.uow.commit()
+
+            else:
+                logger.info(
+                    f"{actor.log} Current subscription found for user '{user.telegram_id}', "
+                    f"expire date '{subscription.expire_at}'"
+                )
+
+                new_expire = max(subscription.expire_at, datetime_now()) + timedelta(
+                    days=reward.amount
+                )
+
+                if new_expire < datetime_now():
+                    logger.warning(
+                        f"{actor.log} Invalid expire time for user '{user.telegram_id}', "
+                        "unable to add referral days"
+                    )
+
+                    event_failed = ReferralRewardFailedEvent(
+                        user=user,
+                        name=data.referred_name,
+                        value=reward.amount,
+                        reward_type=reward.type,
+                    )
+
+                    await self.event_publisher.publish(event_failed)
+                    return
+
+                async with self.uow:
+                    subscription.status = SubscriptionStatus.ACTIVE
+                    subscription.is_trial = False
+                    subscription.expire_at = new_expire
+                    await self.subscription_dao.update(subscription)
+                    await self.remnawave.update_user(
+                        user=user,
+                        uuid=subscription.user_remna_id,
+                        subscription=subscription,
+                    )
+                    await self.uow.commit()
+
+        else:
+            raise ValueError(
+                f"Failed to apply reward: unknown type '{reward.type}' "
+                f"for user '{user.telegram_id}'"
+            )
+
+        event_reward = ReferralRewardReceivedEvent(
+            user=user,
+            name=data.referred_name,
+            value=reward.amount,
+            reward_type=reward.type,
+        )
+
+        await self.event_publisher.publish(event_reward)
+
+        async with self.uow:
+            await self.referral_dao.mark_reward_as_issued(reward.id)  # type: ignore[arg-type]
+            await self.uow.commit()
+
+        logger.info(f"{actor.log} Finished applying reward to user '{user.telegram_id}'")
+
+    @staticmethod
+    def _build_subscription_dto(
+        remna_user: RemnaUserDto,
+        plan: PlanSnapshotDto,
+    ) -> SubscriptionDto:
+        return SubscriptionDto(
+            user_remna_id=remna_user.uuid,
+            status=SubscriptionStatus(remna_user.status),
+            is_trial=False,
+            tag=plan.tag,
+            expire_at=remna_user.expire_at,
+            url=remna_user.subscription_url,
+            plan_snapshot=plan,
+        )
+
+
+@dataclass(frozen=True)
+class AssignReferralRewardsDto:
+    user: UserDto
+    transaction: TransactionDto
+    is_trial_activation: bool = False
+
+
+class AssignReferralRewards(Interactor[AssignReferralRewardsDto, None]):
+    required_permission = None
+
+    def __init__(
+        self,
+        uow: UnitOfWork,
+        settings_dao: SettingsDao,
+        user_dao: UserDao,
+        referral_dao: ReferralDao,
+        calculate_referral_reward: CalculateReferralReward,
+        give_referrer_reward: GiveReferrerReward,
+    ) -> None:
+        self.uow = uow
+        self.settings_dao = settings_dao
+        self.user_dao = user_dao
+        self.referral_dao = referral_dao
+        self.calculate_referral_reward = calculate_referral_reward
+        self.give_referrer_reward = give_referrer_reward
+
+    async def _execute(  # noqa: C901
+        self, actor: UserDto, data: AssignReferralRewardsDto
+    ) -> None:
+        settings = await self.settings_dao.get()
+
+        if not settings.referral.enable:
+            logger.info("Referral system is disabled; reward assignment skipped")
+            return
+
+        if data.is_trial_activation and not settings.referral.reward_for_trial:
+            logger.info("Referral reward for trial activation is disabled; reward skipped")
+            return
+
+        if (
+            settings.referral.accrual_strategy == ReferralAccrualStrategy.ON_FIRST_PAYMENT
+            and data.transaction.purchase_type != PurchaseType.NEW
+        ):
+            logger.info(
+                f"Skip rewards: transaction '{data.transaction.id}' purchase type "
+                f"'{data.transaction.purchase_type}' is not NEW"
+            )
+            return
+
+        referral, parent = await self.referral_dao.get_referral_chain(data.user.telegram_id)
+
+        if not referral:
+            logger.info(f"User '{data.user.telegram_id}' not referred; reward assignment skipped")
+            return
+
+        reward_type = settings.referral.reward.type
+        reward_chain = {ReferralLevel.FIRST: referral.referrer}
+
+        if parent:
+            reward_chain[ReferralLevel.SECOND] = parent.referrer
+
+        for level, referrer in reward_chain.items():
+            if level > settings.referral.level:
+                continue
+
+            config_value = settings.referral.reward.config.get(level)
+            if config_value is None:
+                logger.info(f"No reward config for level '{level.name}'")
+                continue
+
+            reward_already_exists = await self.referral_dao.has_reward(
+                referral.id,  # type: ignore[arg-type]
+                referrer.telegram_id,
+            )
+
+            if (
+                settings.referral.accrual_strategy == ReferralAccrualStrategy.ON_FIRST_PAYMENT
+                and reward_already_exists
+            ):
+                logger.info(
+                    f"Reward for referral '{referral.id}' and referrer "
+                    f"'{referrer.telegram_id}' already exists; skipped"
+                )
+                continue
+
+            reward_amount = await self.calculate_referral_reward.system(
+                CalculateReferralRewardDto(
+                    settings=settings.referral,
+                    transaction=data.transaction,
+                    config_value=config_value,
+                )
+            )
+
+            if not reward_amount or reward_amount <= 0:
+                logger.warning(
+                    f"Reward amount <= 0 for referrer '{referrer.telegram_id}', "
+                    f"level '{level.name}'"
+                )
+                continue
+
+            async with self.uow:
+                reward = await self.referral_dao.create_reward(
+                    reward=ReferralRewardDto(
+                        user_telegram_id=referrer.telegram_id,
+                        type=reward_type,
+                        amount=reward_amount,
+                        is_issued=False,
+                    ),
+                    referral_id=referral.id,  # type: ignore[arg-type]
+                )
+
+                await self.uow.commit()
+
+            await self.give_referrer_reward.system(
+                GiveReferrerRewardDto(
+                    user_telegram_id=referrer.telegram_id,
+                    reward=reward,
+                    referred_name=data.user.name,
+                    plan_snapshot=data.transaction.plan_snapshot,
+                    expert_profile_id=data.transaction.expert_profile_id,
+                )
+            )
+
+            logger.info(
+                f"Issued '{reward_type}' reward '{reward_amount}' for referrer "
+                f"'{referrer.telegram_id}' (level '{level.name}')"
+            )
