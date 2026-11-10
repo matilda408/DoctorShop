@@ -125,7 +125,7 @@ services:
 
     command: >
         taskiq worker src.infrastructure.taskiq.worker:worker
-        --ack-type when_received --tasks-pattern src/infrastructure/taskiq/tasks/*.py -fsd
+        --ack-type when_received --workers 1 --tasks-pattern src/infrastructure/taskiq/tasks/*.py -fsd
 
     depends_on:
         remnashop-migrate:
