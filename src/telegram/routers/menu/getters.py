@@ -17,8 +17,10 @@ from src.core.exceptions import MenuRenderError
 from src.core.utils.i18n_helpers import i18n_format_expire_time
 
 HELP_ICON_CUSTOM_EMOJI_ID: str | None = None
-USER_AGREEMENT_URL = "https://telegram.org/tos"
-PRIVACY_POLICY_URL = "https://telegram.org/privacy"
+USER_AGREEMENT_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-10-18-50"
+PRIVACY_POLICY_URL = (
+    "https://telegra.ph/Politika-konfidencialnosti-Telegram-bota-Onlajn-Doktor-10-18"
+)
 INVITE_SHARE_TEXT = "Привет! Здесь можно получить онлайн-консультацию врача или другого эксперта."
 
 
