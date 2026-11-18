@@ -2,24 +2,20 @@ from aiogram.enums import ButtonStyle
 from aiogram.fsm.state import State
 from aiogram_dialog import Dialog, StartMode
 from aiogram_dialog.widgets.input import MessageInput
-from aiogram_dialog.widgets.kbd import (
-    Button,
-    Row,
-    Start,
-)
+from aiogram_dialog.widgets.kbd import Row, Start
 from aiogram_dialog.widgets.style import Style
 from aiogram_dialog.widgets.text import Format
 from magic_filter import F
 
 from src.application.common.policy import Permission
-from src.core.constants import INLINE_QUERY_INVITE, PAYMENT_PREFIX
-from src.core.enums import BannerName, PurchaseType
+from src.core.constants import INLINE_QUERY_INVITE
+from src.core.enums import BannerName
 from src.telegram.keyboards import custom_buttons
 from src.telegram.routers.dashboard.users.handlers import on_user_search
 from src.telegram.routers.experts.handlers import (
     on_become_expert,
 )
-from src.telegram.states import Dashboard, Experts, MainMenu, Subscription
+from src.telegram.states import Dashboard, Experts, MainMenu
 from src.telegram.utils import require_permission
 from src.telegram.widgets import Banner, I18nFormat, IgnoreUpdate
 from src.telegram.widgets.icon_buttons import (
@@ -32,10 +28,7 @@ from src.telegram.widgets.icon_start import IconStart
 from src.telegram.window import Window
 
 from .getters import invite_getter, menu_getter
-from .handlers import (
-    on_get_trial,
-    on_invite,
-)
+from .handlers import on_invite
 
 INSTRUCTION_EMPTY_LINK = "https://example.com"
 INSTRUCTION_DOWNLOAD_URLS = {
@@ -83,6 +76,14 @@ menu = Window(
             state=Experts.CONSULTATIONS,
             icon_custom_emoji_id="5257969839313526622",
         ),
+        IconSwitchTo(
+            text=I18nFormat("btn-menu.instruction"),
+            id="instruction",
+            state=MainMenu.INSTRUCTION,
+            icon_custom_emoji_id="5260249440450520061",
+        ),
+    ),
+    Row(
         IconStart(
             text=I18nFormat("btn-experts.clients"),
             id="expert_clients",
@@ -175,57 +176,6 @@ support = Window(
 instruction = Window(
     Banner(BannerName.HELP),
     I18nFormat("msg-menu-instruction"),
-    Row(
-        IconSwitchTo(
-            text=I18nFormat("btn-instruction.ios"),
-            id="instruction_ios",
-            state=MainMenu.INSTRUCTION_IOS,
-            when=F["has_active_subscription"],
-            icon_custom_emoji_id="5775870512127283512",
-        ),
-        IconSwitchTo(
-            text=I18nFormat("btn-instruction.android"),
-            id="instruction_android",
-            state=MainMenu.INSTRUCTION_ANDROID,
-            when=F["has_active_subscription"],
-            icon_custom_emoji_id="5100720104375583787",
-        ),
-    ),
-    Row(
-        IconSwitchTo(
-            text=I18nFormat("btn-instruction.windows"),
-            id="instruction_windows",
-            state=MainMenu.INSTRUCTION_WINDOWS,
-            when=F["has_active_subscription"],
-            icon_custom_emoji_id="4976701317385814718",
-        ),
-        IconSwitchTo(
-            text=I18nFormat("btn-instruction.macos"),
-            id="instruction_macos",
-            state=MainMenu.INSTRUCTION_MACOS,
-            when=F["has_active_subscription"],
-            icon_custom_emoji_id="5775870512127283512",
-        ),
-    ),
-    Row(
-        IconStart(
-            text=I18nFormat("btn-subscription.new"),
-            id=f"{PAYMENT_PREFIX}instruction_new",
-            state=Subscription.PLANS,
-            data={"purchase_type": PurchaseType.NEW},
-            when=~F["has_active_subscription"],
-            icon_custom_emoji_id="5258204546391351475",
-        ),
-    ),
-    Row(
-        Button(
-            text=I18nFormat("btn-menu.trial"),
-            id="instruction_trial",
-            on_click=on_get_trial,
-            when=~F["has_active_subscription"] & F["trial_available"],
-            style=Style(ButtonStyle.SUCCESS),
-        ),
-    ),
     Row(
         IconSwitchTo(
             text=I18nFormat("btn-instruction.back"),
